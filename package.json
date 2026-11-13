@@ -1,0 +1,10 @@
+{
+  "name": "kos-backup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "kos-backup 窗口应用的浏览器侧数据面与验收用例",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/acceptance/*/*.test.js"
+  }
+}

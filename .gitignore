@@ -1,0 +1,2 @@
+# Artifacts `make package` writes; they are built, not tracked.
+dist/
