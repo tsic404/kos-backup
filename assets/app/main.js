@@ -1,15 +1,21 @@
-// Boots the backup window: the policy list, read page by page from the control
-// plane, the page model, the display layer and the two entries. The window calls
-// the control-plane API on its own origin, which the desktop BFF proxies
-// (KOSD-C-12); it adds no data path of its own, and an accepted write is shown
-// as acceptance, never as a terminal outcome.
+// Boots the backup window: the policy list and the restore jobs, read page by
+// page from the control plane, the page model, the display layer and the two
+// entries. The window calls the control-plane API on its own origin, which the
+// desktop BFF proxies (KOSD-C-12); it adds no data path of its own, and an
+// accepted write is shown as acceptance, never as a terminal outcome.
 
-import { submitDrill, submitRestore } from "./actions.js";
+import { restoreDeclaration, submitDrill, submitRestoreEntry } from "./actions.js";
 import { createControlPlane } from "./control.js";
 import { buildPage, buildUnreadablePage } from "./model.js";
-import { renderWindow } from "./render.js";
+import {
+  renderDeclaration,
+  renderEntryOutcome,
+  renderWindow,
+  restoreSubmitLabel,
+} from "./render.js";
 
 const POLICY_KIND = "BackupPolicy";
+const RESTORE_KIND = "RestoreJob";
 
 /**
  * mount wires one window document to one control-plane client.
@@ -43,8 +49,9 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
     isBusy = true;
     root.setAttribute("aria-busy", "true");
     try {
-      const policies = await readPolicies(client);
-      root.innerHTML = renderWindow(buildPage({ policies, now: now() }));
+      const policies = await readAll(client, POLICY_KIND);
+      const restores = await readAll(client, RESTORE_KIND);
+      root.innerHTML = renderWindow(buildPage({ policies, restores, now: now() }));
       showNotice("");
     } catch (error) {
       root.innerHTML = renderWindow(buildUnreadablePage({ error, now: now() }));
@@ -63,14 +70,16 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
     const values = new FormData(form);
     try {
       if (form.dataset.entry === "restore") {
-        const answer = await submitRestore(client, {
+        const outcome = await submitRestoreEntry(client, {
           name: field(values, "name"),
           namespace: field(values, "namespace"),
           policy: field(values, "policy"),
+          run: field(values, "run"),
           targetApplication: field(values, "targetApplication"),
           inPlace: values.get("inPlace") === "on",
         });
-        showNotice(describeAnswer("恢复", answer), answer?.accepted === true ? "info" : "error");
+        showOutcome(form, outcome);
+        showNotice(describeOutcome("恢复", outcome), outcome.accepted ? "info" : "error");
       } else {
         const answer = await submitDrill(client, {
           namespace: field(values, "namespace"),
@@ -94,6 +103,26 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
     submitEntry(form);
   });
 
+  root.addEventListener("change", (event) => {
+    const input =
+      event.target instanceof Element
+        ? event.target.closest("form[data-entry='restore'] input[name='inPlace']")
+        : null;
+    if (!input) {
+      return;
+    }
+    const form = input.closest("form");
+    const declaration = restoreDeclaration(input.checked);
+    const slot = form?.querySelector("[data-declaration]");
+    if (slot) {
+      slot.innerHTML = renderDeclaration(declaration.stopRequired);
+    }
+    const button = form?.querySelector("button[data-action='restore']");
+    if (button) {
+      button.textContent = restoreSubmitLabel(declaration.stopRequired);
+    }
+  });
+
   root.addEventListener("click", (event) => {
     const button = event.target instanceof Element ? event.target.closest("button[data-action='reload']") : null;
     if (button) {
@@ -105,20 +134,20 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
 }
 
 /**
- * readPolicies reads every page of the policy list. The page size is the
- * control plane's own (KOSD-C-12), so the window follows the returned cursor:
- * a policy past the first page is still one BACKUP-C-1 presents.
+ * readAll reads every page of one kind's list. The page size is the control
+ * plane's own (KOSD-C-12), so the window follows the returned cursor: an object
+ * past the first page is still one the page presents.
  */
-async function readPolicies(client) {
-  const policies = [];
+async function readAll(client, kind) {
+  const items = [];
   const seen = new Set();
   let cursor = "";
   for (;;) {
-    const page = await client.list(POLICY_KIND, cursor === "" ? {} : { continue: cursor });
-    policies.push(...page.items);
+    const page = await client.list(kind, cursor === "" ? {} : { continue: cursor });
+    items.push(...page.items);
     cursor = typeof page.continue === "string" ? page.continue : "";
     if (cursor === "") {
-      return policies;
+      return items;
     }
     if (seen.has(cursor)) {
       throw new Error("控制面返回了重复的分页游标");
@@ -144,6 +173,21 @@ export function boot() {
 function field(values, name) {
   const value = values.get(name);
   return typeof value === "string" ? value.trim() : "";
+}
+
+function showOutcome(form, outcome) {
+  const slot = form.querySelector("[data-entry-outcome-slot]");
+  if (slot) {
+    slot.innerHTML = renderEntryOutcome(outcome);
+  }
+}
+
+function describeOutcome(label, outcome) {
+  if (outcome?.accepted === true) {
+    return describeAnswer(label, outcome);
+  }
+  const reason = outcome?.reason ?? {};
+  return `${reason.message || "恢复请求未被接受"}（${reason.code || "request-failed"}）`;
 }
 
 function describeAnswer(label, answer) {

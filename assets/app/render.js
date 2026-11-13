@@ -4,6 +4,7 @@
 // success. Only the policy's recorded lastBackup is labelled a backup: a
 // snapshot or a same-failure-domain copy is never presented as one (KOSD-F-12).
 
+import { restoreDeclaration } from "./actions.js";
 import {
   ENTRY_DRILL,
   ENTRY_RESTORE,
@@ -11,6 +12,8 @@ import {
   ITEM_POLICY,
   ITEM_RUNS,
   ITEM_TARGET,
+  RESTORE_FAILED,
+  RESTORE_SUCCEEDED,
 } from "./model.js";
 
 /** Every string a reader sees, kept in one place. */
@@ -47,6 +50,7 @@ const TEXT = {
   baseline: "基线",
   files: "文件数",
   bytes: "字节数",
+  totalBytes: "总字节数",
   checksum: "校验和",
   engines: "引擎",
   path: "目标",
@@ -61,9 +65,36 @@ const TEXT = {
   restoreHint: "默认恢复到新实例，不覆盖现有对象。",
   restoreName: "作业名称",
   restorePolicy: "来源策略",
+  restoreRun: "恢复运行",
   restoreTargetApplication: "目标应用",
   restoreInPlace: "原地恢复（需要应用停机）",
+  restoreStopRequirement: "原地恢复要求应用停机：应用运行中提交会被拒绝，请先停止该应用。",
   restoreSubmit: "恢复到新实例",
+  restoreSubmitInPlace: "原地恢复",
+  accepted: "已接受",
+  notAccepted: "未被接受",
+  restores: "恢复结果",
+  restoreEmpty: "暂无恢复作业",
+  restoreForm: "形态",
+  formNewInstance: "恢复到新实例",
+  formInPlace: "原地恢复",
+  verdict: "判定",
+  verdictSucceeded: "成功",
+  verdictFailed: "失败",
+  verdictPending: "进行中",
+  observed: "观测值",
+  tableRows: "表行数",
+  metricsMissing: "未记录",
+  created: "新建对象",
+  createdApplication: "新应用",
+  createdVolumes: "新卷",
+  source: "源对象",
+  sourceApplication: "源应用",
+  sourceVolumes: "源卷",
+  sourcePVC: "源 PVC",
+  retained: "保留",
+  yes: "是",
+  no: "否",
   drillHint: "演练校验该策略最近一次成功完成的运行。",
   drillSubmit: "执行演练",
 };
@@ -89,6 +120,7 @@ export function renderWindow(page) {
     ${policies.length === 0 && !page.reason ? `<p class="empty" data-empty>${TEXT.empty}</p>` : ""}
   </header>
   ${policies.map(renderPolicy).join("\n")}
+  ${renderRestores(page)}
 </section>`;
 }
 
@@ -224,23 +256,163 @@ function renderEntries(view) {
   const entries = new Map((view.entries ?? []).map((entry) => [entry.id, entry]));
   return `<section class="entries" data-entries>
     <h3>${TEXT.entries}</h3>
-    ${renderRestoreForm(entries.get(ENTRY_RESTORE), view)}
+    ${renderRestoreEntry(entries.get(ENTRY_RESTORE), view)}
     ${renderDrillForm(entries.get(ENTRY_DRILL), view)}
   </section>`;
 }
 
-function renderRestoreForm(entry, view) {
+/**
+ * renderRestoreEntry renders the restore entry. Without a declaration it
+ * submits a restore to a new instance; once the user declares an in-place
+ * restore the entry shows the stop requirement and the submission points at
+ * the existing application (BACKUP-C-3, KOSD-C-41).
+ *
+ * @param {{available?: boolean, reason?: object}|undefined} entry
+ * @param {ReturnType<import("./model.js").policyView>} view
+ * @param {{declared?: boolean}} [options]
+ */
+export function renderRestoreEntry(entry, view, { declared = false } = {}) {
+  const declaration = restoreDeclaration(declared);
+  const runs = Array.isArray(view?.restoreRuns) ? view.restoreRuns : [];
+  const defaultRun = runs.length > 0 ? runs[runs.length - 1].path : "";
   return `<form class="entry" data-entry="${ENTRY_RESTORE}" data-available="${entry?.available === true}">
       <h4>${TEXT.restore}</h4>
       <p class="hint">${TEXT.restoreHint}</p>
       <label>${TEXT.restoreName} <input name="name" autocomplete="off" required></label>
-      <label>${TEXT.namespace} <input name="namespace" value="${escapeHTML(view.namespace ?? "")}" required></label>
-      <label>${TEXT.restorePolicy} <input name="policy" value="${escapeHTML(view.name ?? "")}" required></label>
+      <label>${TEXT.namespace} <input name="namespace" value="${escapeHTML(view?.namespace ?? "")}" required></label>
+      <label>${TEXT.restorePolicy} <input name="policy" value="${escapeHTML(view?.name ?? "")}" required></label>
+      <label>${TEXT.restoreRun} <select name="run" data-default-run="${escapeHTML(defaultRun)}" required${runs.length === 0 ? " disabled" : ""}>
+        ${runs.map((run) => `<option value="${escapeHTML(run.path)}"${run.path === defaultRun ? " selected" : ""}>${escapeHTML(runLabel(run))}</option>`).join("")}
+      </select></label>
       <label>${TEXT.restoreTargetApplication} <input name="targetApplication" autocomplete="off" required></label>
-      <label class="check"><input type="checkbox" name="inPlace"> ${TEXT.restoreInPlace}</label>
-      <button type="submit" data-action="${ENTRY_RESTORE}"${entry?.available === true ? "" : " disabled"}>${TEXT.restoreSubmit}</button>
+      <label class="check"><input type="checkbox" name="inPlace"${declaration.inPlace ? " checked" : ""}> ${TEXT.restoreInPlace}</label>
+      <div data-declaration>${renderDeclaration(declared)}</div>
+      <button type="submit" data-action="${ENTRY_RESTORE}"${entry?.available === true ? "" : " disabled"}>${escapeHTML(restoreSubmitLabel(declared))}</button>
       ${entry?.reason ? entryReason(entry.reason) : ""}
+      <div data-entry-outcome-slot></div>
     </form>`;
+}
+
+/** renderDeclaration is the stop requirement the in-place declaration adds. */
+export function renderDeclaration(declared) {
+  return declared === true ? `<p class="stop-requirement" data-stop-requirement>${TEXT.restoreStopRequirement}</p>` : "";
+}
+
+/** restoreSubmitLabel follows the declared form. */
+export function restoreSubmitLabel(declared) {
+  return declared === true ? TEXT.restoreSubmitInPlace : TEXT.restoreSubmit;
+}
+
+/**
+ * renderEntryOutcome renders the control plane's answer to one submission:
+ * acceptance with the object reference, or the rejection reason with its code.
+ *
+ * @param {{accepted: boolean, ref: object|null, reason: {code: string, message: string}|null}} outcome
+ */
+export function renderEntryOutcome(outcome) {
+  if (outcome?.accepted === true) {
+    const ref = outcome.ref ?? {};
+    const where = [ref.namespace, ref.name].filter((part) => Boolean(part)).join("/");
+    const kind = ref.kind ? `${ref.kind} ` : "";
+    return `<p class="outcome" data-entry-outcome data-accepted="true">${TEXT.accepted}：${escapeHTML(present(`${kind}${where}`))}</p>`;
+  }
+  const reason = outcome?.reason ?? {};
+  const code = present(reason.code);
+  const message = present(reason.message);
+  return `<p class="outcome" data-entry-outcome data-accepted="false" data-code="${escapeHTML(code)}">${TEXT.notAccepted}：${escapeHTML(message)}（${escapeHTML(code)}）</p>`;
+}
+
+function runLabel(run) {
+  return [run.completedAt, run.path].filter((part) => Boolean(part)).join(" · ");
+}
+
+function renderRestores(page) {
+  const restores = Array.isArray(page.restores) ? page.restores : [];
+  return `<section class="restores" data-restores>
+  <h2>${TEXT.restores}</h2>
+  ${restores.length === 0 ? `<p class="empty" data-restore-empty>${TEXT.restoreEmpty}</p>` : restores.map(renderRestore).join("\n")}
+</section>`;
+}
+
+function renderRestore(view) {
+  return `<article class="restore" data-restore="${escapeHTML(present(view.id))}" data-phase="${escapeHTML(present(view.phase))}" data-verdict="${escapeHTML(present(view.verdict))}" data-in-place="${view.inPlace === true}" data-stale="${view.stale === true}">
+  <header class="restore-header">
+    <h3>${escapeHTML(present(view.name))}</h3>
+    <dl class="facts">
+      ${fact(TEXT.phase, view.phase)}
+      ${fact(TEXT.restoreForm, view.inPlace ? TEXT.formInPlace : TEXT.formNewInstance)}
+      ${fact(TEXT.verdict, verdictLabel(view.verdict))}
+      ${fact(TEXT.restorePolicy, view.policy)}
+      ${fact(TEXT.restoreRun, view.run)}
+      ${fact(TEXT.restoreTargetApplication, view.targetApplication)}
+      ${fact(TEXT.observedAt, view.observedAt)}
+    </dl>
+    ${view.stale === true ? staleMark() : ""}
+  </header>
+  ${metricsBlock("baseline", TEXT.baseline, view.baseline)}
+  ${metricsBlock("observed", TEXT.observed, view.observed)}
+  ${view.reason ? reasonBlock(view.reason) : ""}
+  ${createdBlock(view.created)}
+  ${sourceBlock(view.source)}
+</article>`;
+}
+
+/** metricsBlock is one side of the four-item comparison KOSD-C-42 fixes. */
+function metricsBlock(side, label, metrics) {
+  const attributes = metrics
+    ? ` data-tables="${escapeHTML(describeTables(metrics.tables))}" data-files="${escapeHTML(present(metrics.files))}" data-bytes="${escapeHTML(present(metrics.bytes))}" data-checksum="${escapeHTML(present(metrics.checksum))}"`
+    : ` data-unreadable="true"`;
+  const body = metrics
+    ? `<dl class="facts">
+      ${fact(TEXT.tableRows, describeTables(metrics.tables))}
+      ${fact(TEXT.files, metrics.files)}
+      ${fact(TEXT.totalBytes, metrics.bytes)}
+      ${fact(TEXT.checksum, metrics.checksum)}
+    </dl>`
+    : `<p>${TEXT.metricsMissing}</p>`;
+  return `<section class="metrics" data-metrics="${side}"${attributes}>
+    <h4>${label}</h4>
+    ${body}
+  </section>`;
+}
+
+/** createdBlock lists the objects a new-instance restore produced. */
+function createdBlock(created) {
+  if (created.application === "" && created.volumes.length === 0) {
+    return "";
+  }
+  return `<div class="objects" data-created><h4>${TEXT.created}</h4><dl class="facts">
+      ${fact(TEXT.createdApplication, created.application)}
+      ${fact(TEXT.createdVolumes, created.volumes.join("，"))}
+    </dl></div>`;
+}
+
+/** sourceBlock lists the source objects the restore left in place. */
+function sourceBlock(source) {
+  if (source.application === "" && source.volumes.length === 0 && source.pvc === "") {
+    return "";
+  }
+  return `<div class="objects" data-source><h4>${TEXT.source}</h4><dl class="facts">
+      ${fact(TEXT.sourceApplication, source.application)}
+      ${fact(TEXT.sourceVolumes, source.volumes.join("，"))}
+      ${fact(TEXT.sourcePVC, source.pvc)}
+      ${fact(TEXT.retained, source.retained ? TEXT.yes : TEXT.no)}
+    </dl></div>`;
+}
+
+function describeTables(tables) {
+  return (tables ?? []).map((table) => `${table.name}=${present(table.rows)}`).join("，");
+}
+
+function verdictLabel(verdict) {
+  switch (verdict) {
+    case RESTORE_SUCCEEDED:
+      return TEXT.verdictSucceeded;
+    case RESTORE_FAILED:
+      return TEXT.verdictFailed;
+    default:
+      return TEXT.verdictPending;
+  }
 }
 
 function renderDrillForm(entry, view) {

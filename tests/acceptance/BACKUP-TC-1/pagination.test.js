@@ -37,6 +37,12 @@ function countOf(html, needle) {
   return html.split(needle).length - 1;
 }
 
+function policyReads(control) {
+  return control.requests.filter(
+    (request) => request.method === "GET" && request.path === "/api/v1/resources/BackupPolicy",
+  );
+}
+
 function namedPolicy(policy, name) {
   policy.metadata.name = name;
   return policy;
@@ -55,7 +61,7 @@ test("单页读完后不再发请求，页面显示全部策略", async () => {
 
   await mount(root, { client, now: () => AT_OBSERVATION });
 
-  assert.equal(control.requests.length, 1, "没有游标时不再读取下一页");
+  assert.equal(policyReads(control).length, 1, "没有游标时不再读取下一页");
   assert.ok(root.innerHTML.includes(`data-policy="${idOf(policy)}"`));
   for (const itemId of ITEM_IDS) {
     assert.equal(countOf(root.innerHTML, `data-item="${itemId}"`), 1, `「${itemId}」项未渲染`);
@@ -71,8 +77,9 @@ test("游标未读完时继续读取，第二页的策略与四项视图也渲�
 
   await mount(root, { client, now: () => AT_OBSERVATION });
 
-  assert.equal(control.requests.length, 2, "游标存在时必须读下一页");
-  assert.equal(control.requests[1].query.continue, "1", "下一页请求带回上一页的游标");
+  const reads = policyReads(control);
+  assert.equal(reads.length, 2, "游标存在时必须读下一页");
+  assert.equal(reads[1].query.continue, "1", "下一页请求带回上一页的游标");
 
   for (const policy of [first, second]) {
     assert.ok(root.innerHTML.includes(`data-policy="${idOf(policy)}"`), `策略 ${idOf(policy)} 未渲染`);
