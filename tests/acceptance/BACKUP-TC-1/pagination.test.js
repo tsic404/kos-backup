@@ -43,6 +43,16 @@ function policyReads(control) {
   );
 }
 
+/** sessionReads are the reads of the session the write entries are gated by. */
+function sessionReads(control) {
+  return control.requests.filter((request) => request.path === "/api/v1/auth/session");
+}
+
+/** restoreReads are the reads of the restore list, one page per refresh. */
+function restoreReads(control) {
+  return control.requests.filter((request) => request.path === "/api/v1/resources/RestoreJob");
+}
+
 function namedPolicy(policy, name) {
   policy.metadata.name = name;
   return policy;
@@ -62,6 +72,9 @@ test("单页读完后不再发请求，页面显示全部策略", async () => {
   await mount(root, { client, now: () => AT_OBSERVATION });
 
   assert.equal(policyReads(control).length, 1, "没有游标时不再读取下一页");
+  assert.equal(sessionReads(control).length, 1, "一次刷新只读一次会话");
+  assert.equal(restoreReads(control).length, 1, "一次刷新只读一次恢复作业列表");
+  assert.equal(control.requests.length, 3, "一次刷新只发会话、策略与恢复三个请求");
   assert.ok(root.innerHTML.includes(`data-policy="${idOf(policy)}"`));
   for (const itemId of ITEM_IDS) {
     assert.equal(countOf(root.innerHTML, `data-item="${itemId}"`), 1, `「${itemId}」项未渲染`);

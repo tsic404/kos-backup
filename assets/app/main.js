@@ -1,13 +1,18 @@
-// Boots the backup window: the policy list and the restore jobs, read page by
-// page from the control plane, the page model, the display layer and the two
-// entries. The window calls the control-plane API on its own origin, which the
-// desktop BFF proxies (KOSD-C-12); it adds no data path of its own, and an
-// accepted write is shown as acceptance, never as a terminal outcome.
+// Boots the backup window: the session the write entries are gated by, the
+// policy list and the restore jobs read page by page from the control plane,
+// the page model, the display layer and the writes. Create and change share
+// policy.js's one construction path; a rejected submission keeps the typed
+// values and shows its reason in the form that carried it, and an accepted one
+// is announced as acceptance, never as a terminal outcome (KOSD-C-12,
+// BACKUP-C-2). The restore entry keeps its own declaration and outcome.
 
 import { restoreDeclaration, submitDrill, submitRestoreEntry } from "./actions.js";
 import { createControlPlane } from "./control.js";
-import { buildPage, buildUnreadablePage } from "./model.js";
+import { ENTRY_EDIT, buildPage, buildUnreadablePage } from "./model.js";
+import { submitPolicy } from "./policy.js";
 import {
+  ENTRY_CREATE,
+  FORM_CREATE,
   renderDeclaration,
   renderEntryOutcome,
   renderWindow,
@@ -22,9 +27,9 @@ const RESTORE_KIND = "RestoreJob";
  *
  * @param {HTMLElement} root the window document's root element
  * @param {{client: ReturnType<import("./control.js").createControlPlane>,
- *          notice?: HTMLElement|null, now?: () => Date}} options
+ *          notice?: HTMLElement|null, now?: () => Date, namespace?: string}} options
  */
-export function mount(root, { client, notice = null, now = () => new Date() } = {}) {
+export function mount(root, { client, notice = null, now = () => new Date(), namespace = "" } = {}) {
   if (!root) {
     throw new TypeError("备份窗口需要一个根元素");
   }
@@ -33,6 +38,8 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
   }
 
   let isBusy = false;
+  let source = { policies: [], restores: [], session: null, sessionFailure: null };
+  let rejection = null;
 
   function showNotice(message, tone = "info") {
     if (!notice) {
@@ -42,19 +49,56 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
     notice.textContent = message;
   }
 
-  async function refresh() {
+  function paint() {
+    root.innerHTML = renderWindow(buildPage({ ...source, now: now(), namespace, rejection }));
+  }
+
+  async function refresh({ announcement = null } = {}) {
     if (isBusy) {
       return;
     }
     isBusy = true;
     root.setAttribute("aria-busy", "true");
     try {
-      const policies = await readAll(client, POLICY_KIND);
-      const restores = await readAll(client, RESTORE_KIND);
-      root.innerHTML = renderWindow(buildPage({ policies, restores, now: now() }));
-      showNotice("");
+      source = await readSource(client);
+      rejection = null;
+      paint();
+      // A read clears the last answer; a write hands its answer over so the
+      // acceptance stays readable after the refreshed page is painted.
+      showNotice(announcement?.message ?? "", announcement?.tone ?? "info");
     } catch (error) {
       root.innerHTML = renderWindow(buildUnreadablePage({ error, now: now() }));
+      showNotice(describeFailure(error), "error");
+    } finally {
+      isBusy = false;
+      root.removeAttribute("aria-busy");
+    }
+  }
+
+  async function submitPolicyForm(form) {
+    if (isBusy) {
+      return;
+    }
+    isBusy = true;
+    root.setAttribute("aria-busy", "true");
+    const fields = new FormData(form);
+    const submitted = {
+      name: field(fields, "name"),
+      namespace: field(fields, "namespace"),
+      ...policyFormValues(fields),
+    };
+    const isChange = form.dataset.entry === ENTRY_EDIT;
+    try {
+      const answer = await submitPolicy(client, { ...submitted, existing: isChange });
+      const message = describeAnswer(isChange ? "策略修改" : "策略创建", answer);
+      rejection = null;
+      isBusy = false;
+      await refresh({ announcement: { message, tone: answer?.accepted === true ? "info" : "error" } });
+    } catch (error) {
+      // The typed values stay on screen with the reason: the rejected write is
+      // shown as rejected, and the policy list is the one already read.
+      rejection = rejectionOf(error, form.dataset.form ?? FORM_CREATE, submitted);
+      paint();
       showNotice(describeFailure(error), "error");
     } finally {
       isBusy = false;
@@ -100,6 +144,11 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
       return;
     }
     event.preventDefault();
+    const entry = form.dataset.entry;
+    if (entry === ENTRY_CREATE || entry === ENTRY_EDIT) {
+      submitPolicyForm(form);
+      return;
+    }
     submitEntry(form);
   });
 
@@ -131,6 +180,95 @@ export function mount(root, { client, notice = null, now = () => new Date() } = 
   });
 
   return refresh();
+}
+
+/**
+ * loadPage reads the session, the policy list and the restore jobs, then builds
+ * the page the window renders. A session that cannot be read gates every policy
+ * closed: an unproven session gets no write entry (BACKUP-C-2, KOSD-C-60).
+ *
+ * @param {ReturnType<import("./control.js").createControlPlane>} client
+ * @param {{now?: () => Date, namespace?: string, rejection?: object|null}} [options]
+ */
+export async function loadPage(client, { now = () => new Date(), namespace = "", rejection = null } = {}) {
+  const source = await readSource(client);
+  return buildPage({ ...source, now: now(), namespace, rejection });
+}
+
+/**
+ * policyFormValues reads one submitted form as the six parts of KOSD-C-41. An
+ * absent target, retention or drill stays absent, so the spec carries only what
+ * the user set; the owner is not read because the form has no such field.
+ *
+ * @param {{get: (name: string) => FormDataEntryValue|null}} values
+ */
+export function policyFormValues(values) {
+  const keep = field(values, "retentionKeep");
+  return {
+    selector: field(values, "selector"),
+    schedule: field(values, "schedule"),
+    consistency: field(values, "consistency"),
+    target: { path: field(values, "targetPath"), failureDomain: field(values, "failureDomain") },
+    retention: keep === "" ? undefined : { keep: Number(keep) },
+    drill: { enabled: values.get("drill") === "on" },
+  };
+}
+
+/**
+ * rejectionOf turns one rejected write into what the form shows: the control
+ * plane's code and message, the object it points at, and the field a local
+ * validation named. The submitted values travel with it so the form keeps them.
+ */
+export function rejectionOf(error, form, values) {
+  const envelope = error?.envelope ?? {};
+  const object = envelope.object && typeof envelope.object === "object" ? envelope.object : null;
+  return {
+    form,
+    code: envelope.code || error?.code || "write-rejected",
+    message: envelope.message || error?.message || "策略提交被拒绝",
+    field: typeof error?.field === "string" ? error.field : "",
+    object: object
+      ? { kind: object.kind ?? "", namespace: object.namespace ?? "", name: object.name ?? "" }
+      : null,
+    values,
+  };
+}
+
+/**
+ * readSource reads the session, every page of the policy list and every page of
+ * the restore list. The page size is the control plane's own (KOSD-C-12), so the
+ * window follows the returned cursor: an object past the first page is still
+ * one the page presents.
+ */
+async function readSource(client) {
+  const { session, failure } = await readSession(client);
+  return {
+    session,
+    sessionFailure: failure,
+    policies: await readAll(client, POLICY_KIND),
+    restores: await readAll(client, RESTORE_KIND),
+  };
+}
+
+/**
+ * readSession reads the session the write entries are judged against. An
+ * unreadable session is no session — every policy is then unmanageable, the
+ * closed side of the gate — and the failure is kept so the page can name why
+ * no entry is offered (KOSD-C-59, KOSD-C-60).
+ */
+async function readSession(client) {
+  try {
+    return { session: await client.session(), failure: null };
+  } catch (error) {
+    const envelope = error?.envelope ?? {};
+    return {
+      session: null,
+      failure: {
+        code: envelope.code || error?.code || "session-unreadable",
+        message: envelope.message || error?.message || "控制面无法读取会话",
+      },
+    };
+  }
 }
 
 /**
@@ -167,7 +305,7 @@ export function boot() {
   }
   const notice = document.querySelector("#backup-notice");
   const client = createControlPlane({ baseURL: window.location.origin });
-  return mount(root, { client, notice });
+  return mount(root, { client, notice, namespace: root.dataset.namespace ?? "" });
 }
 
 function field(values, name) {

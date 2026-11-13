@@ -4,6 +4,11 @@
 // (KOSD-C-13). A restore is a success only when the four items KOSD-C-42 fixes
 // are equal, never because the job claims it; an item that cannot be presented
 // as normal carries its reason instead of a normal-looking value.
+//
+// The write entries are the session's: a policy this session manages carries the
+// change entry and nothing else carries a write path (BACKUP-C-2, KOSD-C-60).
+
+import { canManagePolicy, policyValues } from "./policy.js";
 
 /** The one freshness bound every read is judged by (KOSD-C-13). */
 export const STALE_THRESHOLD_MS = 2 * 60 * 1000;
@@ -17,6 +22,9 @@ export const ITEM_DRILL = "drill";
 /** The two actions the page offers (BACKUP-C-1, BACKUP-C-3). */
 export const ENTRY_RESTORE = "restore";
 export const ENTRY_DRILL = "drill";
+
+/** The write entry a session gets on a policy it manages (BACKUP-C-2). */
+export const ENTRY_EDIT = "edit";
 
 /** The restore judgement: only four equal items are a success (KOSD-C-42). */
 export const RESTORE_SUCCEEDED = "Succeeded";
@@ -39,13 +47,26 @@ const STATE_UNKNOWN = "Unknown";
 
 /**
  * buildPage assembles the page from the BackupPolicy and RestoreJob
- * projections the list calls returned.
+ * projections the list calls returned. The session decides which policies
+ * carry the write entry, and `rejection` is the answer the last submission
+ * received: the form that carried it shows the reason, and nothing is
+ * presented as written (BACKUP-C-2).
  *
  * @param {{policies: import("./control.js").Projection[],
  *          restores?: import("./control.js").Projection[],
- *          now?: Date|string|number}} input
+ *          now?: Date|string|number, session?: {username: string, role: string}|null,
+ *          namespace?: string, rejection?: object|null,
+ *          sessionFailure?: {code: string, message: string}|null}} input
  */
-export function buildPage({ policies, restores = [], now = new Date() }) {
+export function buildPage({
+  policies,
+  restores = [],
+  now = new Date(),
+  session = null,
+  namespace = "",
+  rejection = null,
+  sessionFailure = null,
+}) {
   if (!Array.isArray(policies)) {
     throw new TypeError("备份页需要策略投影列表");
   }
@@ -53,13 +74,18 @@ export function buildPage({ policies, restores = [], now = new Date() }) {
     throw new TypeError("备份页需要恢复作业投影列表");
   }
   const clock = toDate(now);
-  const views = policies.map((projection) => policyView(projection, clock));
+  const views = policies.map((projection) => policyView(projection, clock, session));
   const restoreViews = restores.map((projection) => restoreView(projection, clock));
   const observation = oldestObservation([...views, ...restoreViews]);
   return {
     state: STATE_UNKNOWN,
     observedAt: observation.observedAt,
     stale: observation.stale,
+    namespace,
+    rejection,
+    // Without a session no policy is manageable; the page says why rather than
+    // showing an unexplained absence of every write entry (KOSD-C-60).
+    sessionReason: sessionFailure,
     policies: views,
     restores: restoreViews,
   };
@@ -90,12 +116,13 @@ export function buildUnreadablePage({ error, now = new Date() }) {
 }
 
 /**
- * policyView builds one policy's four items.
+ * policyView builds one policy's four items and the entries this session gets.
  *
  * @param {import("./control.js").Projection} projection
  * @param {Date} now
+ * @param {{username: string, role: string}|null} session
  */
-export function policyView(projection, now = new Date()) {
+export function policyView(projection, now = new Date(), session = null) {
   const clock = toDate(now);
   const object = projection?.object ?? {};
   const spec = object.spec ?? {};
@@ -103,6 +130,7 @@ export function policyView(projection, now = new Date()) {
   const observedAt = projection?.observedAt ?? null;
   const staleness = stalenessOf(observedAt, clock);
   const stamp = { observedAt, stale: staleness.stale };
+  const manageable = canManagePolicy(object, session);
 
   const run = status.lastBackup ?? null;
   const drill = status.lastDrill ?? null;
@@ -161,7 +189,11 @@ export function policyView(projection, now = new Date()) {
         reason: drillReason(drill),
       },
     },
-    entries: entriesFor(run, drill, restoreRuns),
+    manageable,
+    // The six parts a change starts from; the owner is not among them, so the
+    // form has nothing to rewrite (KOSD-C-60).
+    values: policyValues({ object }),
+    entries: entriesFor(run, drill, { restoreRuns, manageable }),
   };
 }
 
@@ -472,9 +504,14 @@ function describeDiffs(diffs) {
     .join("；");
 }
 
-function entriesFor(run, drill, restoreRuns = []) {
+/**
+ * entriesFor lists the actions one policy offers: a restore when the object
+ * records a restorable run, a drill when it records a run or a drill, and the
+ * change entry only when this session manages the policy (BACKUP-C-2).
+ */
+function entriesFor(run, drill, { restoreRuns = [], manageable = false } = {}) {
   const restorable = restoreRuns.length > 0;
-  return [
+  const entries = [
     {
       id: ENTRY_RESTORE,
       action: ENTRY_RESTORE,
@@ -493,6 +530,10 @@ function entriesFor(run, drill, restoreRuns = []) {
           : { code: "no-run", message: "没有可演练的运行，演练入口不可用" },
     },
   ];
+  if (manageable) {
+    entries.push({ id: ENTRY_EDIT, action: ENTRY_EDIT, available: true, reason: null });
+  }
+  return entries;
 }
 
 function failedCondition(conditions) {
