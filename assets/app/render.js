@@ -1,12 +1,15 @@
-// The backup window's display layer: the four items BACKUP-C-1 reads and the
-// two entries it offers. Every shown state is the kernel value the projection
-// carries; this module adds only the markers it names and never derives a
-// success. Only the policy's recorded lastBackup is labelled a backup: a
-// snapshot or a same-failure-domain copy is never presented as one (KOSD-F-12).
+// The backup window's display layer: the four items BACKUP-C-1 reads, the two
+// entries it offers, the policy write forms BACKUP-C-2 gates by session, and the
+// restore results of BACKUP-C-3. Every shown state is the kernel value the
+// projection carries; this module adds only the markers it names and never
+// derives a success. Only the policy's recorded lastBackup is labelled a backup:
+// a snapshot or a same-failure-domain copy is never presented as one
+// (KOSD-F-12).
 
 import { restoreDeclaration } from "./actions.js";
 import {
   ENTRY_DRILL,
+  ENTRY_EDIT,
   ENTRY_RESTORE,
   ITEM_DRILL,
   ITEM_POLICY,
@@ -15,6 +18,20 @@ import {
   RESTORE_FAILED,
   RESTORE_SUCCEEDED,
 } from "./model.js";
+import { CONSISTENCY_CRASH, CONSISTENCY_HOOK, CONSISTENCY_LEVELS, CONSISTENCY_QUIESCED } from "./policy.js";
+
+/** The create entry every readable page offers (BACKUP-C-2). */
+export const ENTRY_CREATE = "policy";
+
+/** The form id the create entry carries; a change carries its policy's id. */
+export const FORM_CREATE = "create";
+
+/** formIdOf names the form one policy's change is submitted from. */
+export function formIdOf(view) {
+  const name = view?.name ?? "";
+  const namespace = view?.namespace ?? "";
+  return namespace === "" ? name : `${namespace}/${name}`;
+}
 
 /** Every string a reader sees, kept in one place. */
 const TEXT = {
@@ -97,6 +114,23 @@ const TEXT = {
   no: "否",
   drillHint: "演练校验该策略最近一次成功完成的运行。",
   drillSubmit: "执行演练",
+  create: "新建策略",
+  edit: "修改策略",
+  policyName: "策略名称",
+  targetPath: "目标路径",
+  retentionKeep: "保留份数",
+  drillToggle: "启用演练",
+  createSubmit: "创建策略",
+  editSubmit: "提交修改",
+  rejected: "提交被拒绝",
+  sessionUnreadable: "无法读取会话，策略没有修改入口",
+};
+
+/** The three consistency levels in the words KOSD-C-41 names them. */
+const CONSISTENCY_TEXT = {
+  [CONSISTENCY_CRASH]: "崩溃一致",
+  [CONSISTENCY_QUIESCED]: "静默一致",
+  [CONSISTENCY_HOOK]: "应用钩子",
 };
 
 /**
@@ -110,6 +144,8 @@ export function renderWindow(page) {
     throw new TypeError("备份页需要读视图");
   }
   const policies = Array.isArray(page.policies) ? page.policies : [];
+  const rejection = page.rejection ?? null;
+  const rejectionPlaced = rejection !== null && rejectionLands(rejection, policies);
   return `<section class="backup-page" data-page="backup" data-state="${escapeHTML(present(page.state))}" data-stale="${page.stale === true}">
   <header class="page-header">
     <h1>${TEXT.title}</h1>
@@ -117,14 +153,25 @@ export function renderWindow(page) {
     ${page.stale === true ? staleMark() : ""}
     <button type="button" data-action="reload">${TEXT.reload}</button>
     ${page.reason ? pageReason(page.reason) : ""}
+    ${page.sessionReason ? sessionReasonBlock(page.sessionReason) : ""}
+    ${rejection !== null && !rejectionPlaced ? rejectionBlock(rejection, "data-page-rejection") : ""}
     ${policies.length === 0 && !page.reason ? `<p class="empty" data-empty>${TEXT.empty}</p>` : ""}
   </header>
-  ${policies.map(renderPolicy).join("\n")}
-  ${renderRestores(page)}
+  ${page.reason ? "" : renderCreateForm(page, rejection)}
+  ${policies.map((view) => renderPolicy(view, rejection)).join("\n")}
+  ${page.reason ? "" : renderRestores(page)}
 </section>`;
 }
 
-function renderPolicy(view) {
+/** rejectionLands reports whether one rendered form shows the rejection. */
+function rejectionLands(rejection, policies) {
+  return (
+    rejection.form === FORM_CREATE ||
+    policies.some((view) => view.manageable === true && formIdOf(view) === rejection.form)
+  );
+}
+
+function renderPolicy(view, rejection) {
   const items = view.items ?? {};
   return `<article class="policy" data-policy="${escapeHTML(present(view.id))}" data-stale="${view.stale === true}">
   <header class="policy-header">
@@ -139,7 +186,7 @@ function renderPolicy(view) {
   ${renderRunsItem(items[ITEM_RUNS])}
   ${renderTargetItem(items[ITEM_TARGET])}
   ${renderDrillItem(items[ITEM_DRILL])}
-  ${renderEntries(view)}
+  ${renderEntries(view, rejection)}
 </article>`;
 }
 
@@ -252,13 +299,102 @@ function itemTitle(id) {
   }
 }
 
-function renderEntries(view) {
+function renderEntries(view, rejection) {
   const entries = new Map((view.entries ?? []).map((entry) => [entry.id, entry]));
+  const edit = entries.get(ENTRY_EDIT);
   return `<section class="entries" data-entries>
     <h3>${TEXT.entries}</h3>
+    ${edit ? renderPolicyForm(view, rejection) : ""}
     ${renderRestoreEntry(entries.get(ENTRY_RESTORE), view)}
     ${renderDrillForm(entries.get(ENTRY_DRILL), view)}
   </section>`;
+}
+
+/**
+ * renderPolicyForm is the change form of one policy. It is rendered only when
+ * the session has the edit entry: a policy this session cannot manage offers
+ * no write path at all, and the form carries only the six parts a change may
+ * set — never the owner (BACKUP-C-2, KOSD-C-60).
+ */
+function renderPolicyForm(view, rejection) {
+  const id = formIdOf(view);
+  const reason = rejection?.form === id ? rejection : null;
+  const values = reason?.values ?? view.values ?? {};
+  return `<form class="entry" data-entry="${ENTRY_EDIT}" data-form="${escapeHTML(id)}" data-policy="${escapeHTML(id)}">
+      <h4>${TEXT.edit}</h4>
+      <input type="hidden" name="namespace" value="${escapeHTML(view.namespace ?? "")}">
+      <input type="hidden" name="name" value="${escapeHTML(view.name ?? "")}">
+      ${policyFields(values, reason)}
+      <button type="submit" data-action="${ENTRY_EDIT}">${TEXT.editSubmit}</button>
+      ${reason ? rejectionBlock(reason, "data-form-reason") : ""}
+    </form>`;
+}
+
+/**
+ * renderCreateForm is the create entry of one readable page. It carries the
+ * same six parts as a change, so creation and change cannot drift apart.
+ */
+function renderCreateForm(page, rejection) {
+  const reason = rejection?.form === FORM_CREATE ? rejection : null;
+  const values = reason?.values ?? {};
+  return `<form class="entry" data-entry="${ENTRY_CREATE}" data-form="${FORM_CREATE}">
+      <h4>${TEXT.create}</h4>
+      <label>${TEXT.policyName} <input name="name" autocomplete="off" required value="${escapeHTML(values.name ?? "")}"${invalidFor(reason, "name")}></label>
+      <label>${TEXT.namespace} <input name="namespace" autocomplete="off" required value="${escapeHTML(values.namespace ?? page.namespace ?? "")}"${invalidFor(reason, "namespace")}></label>
+      ${policyFields(values, reason)}
+      <button type="submit" data-action="${ENTRY_CREATE}">${TEXT.createSubmit}</button>
+      ${reason ? rejectionBlock(reason, "data-form-reason") : ""}
+    </form>`;
+}
+
+/** policyFields renders the six parts a policy write carries (KOSD-C-41). */
+function policyFields(values, reason) {
+  const target = values.target ?? {};
+  const drill = values.drill ?? {};
+  const keep = Number.isInteger(values.retention?.keep) ? String(values.retention.keep) : "";
+  return `<label>${TEXT.selector} <input name="selector" autocomplete="off" required value="${escapeHTML(values.selector ?? "")}"${invalidFor(reason, "selector")}></label>
+      <label>${TEXT.schedule} <input name="schedule" autocomplete="off" required value="${escapeHTML(values.schedule ?? "")}"${invalidFor(reason, "schedule")}></label>
+      <label>${TEXT.consistency} <select name="consistency" required${invalidFor(reason, "consistency")}>${consistencyOptions(values.consistency)}</select></label>
+      <label>${TEXT.targetPath} <input name="targetPath" autocomplete="off" value="${escapeHTML(target.path ?? "")}"${invalidFor(reason, "target.path")}></label>
+      <label>${TEXT.failureDomain} <input name="failureDomain" autocomplete="off" value="${escapeHTML(target.failureDomain ?? "")}"${invalidFor(reason, "target.failureDomain")}></label>
+      <label>${TEXT.retentionKeep} <input type="number" name="retentionKeep" min="1" step="1" value="${escapeHTML(keep)}"${invalidFor(reason, "retention.keep")}></label>
+      <label class="check"><input type="checkbox" name="drill"${drill.enabled === true ? " checked" : ""}${invalidFor(reason, "drill.enabled")}> ${TEXT.drillToggle}</label>`;
+}
+
+function consistencyOptions(value) {
+  return CONSISTENCY_LEVELS.map(
+    (level) => `<option value="${escapeHTML(level)}"${level === value ? " selected" : ""}>${escapeHTML(CONSISTENCY_TEXT[level] ?? level)}</option>`,
+  ).join("");
+}
+
+/** invalidFor marks the field a rejected submission named (BACKUP-C-2). */
+function invalidFor(reason, field) {
+  return reason?.field === field ? ' aria-invalid="true" data-invalid="true"' : "";
+}
+
+/**
+ * rejectionBlock names the reason and the field or object it points at. A
+ * rejected submission is never shown as written: the block is the only thing a
+ * rejected form adds (BACKUP-C-2).
+ */
+function rejectionBlock(reason, marker) {
+  const object = objectName(reason.object);
+  const field = reason.field ? ` data-field="${escapeHTML(reason.field)}"` : "";
+  const objectAttribute = object === "" ? "" : ` data-object="${escapeHTML(object)}"`;
+  const where = object === "" ? "" : `（${escapeHTML(object)}）`;
+  return `<p class="reason" ${marker} data-code="${escapeHTML(present(reason.code))}"${field}${objectAttribute}>${TEXT.rejected}：${escapeHTML(present(reason.message))}${where}</p>`;
+}
+
+/** objectName is the reference a reason points at, as one readable name. */
+function objectName(object) {
+  if (!object || typeof object !== "object") {
+    return "";
+  }
+  const kind = object.kind ?? "";
+  const name = object.name ?? "";
+  const namespace = object.namespace ?? "";
+  const where = namespace === "" ? name : `${namespace}/${name}`;
+  return [kind, where].filter((part) => part !== "").join(" ");
 }
 
 /**
@@ -428,6 +564,11 @@ function renderDrillForm(entry, view) {
 
 function entryReason(reason) {
   return `<p class="reason" data-entry-reason data-code="${escapeHTML(present(reason.code))}">${escapeHTML(present(reason.message))}</p>`;
+}
+
+/** sessionReasonBlock names why the page offers no write entry at all. */
+function sessionReasonBlock(reason) {
+  return `<p class="reason" data-session-reason data-code="${escapeHTML(present(reason.code))}">${TEXT.sessionUnreadable}：${escapeHTML(present(reason.message))}（${escapeHTML(present(reason.code))}）</p>`;
 }
 
 function pageReason(reason) {

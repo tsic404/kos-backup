@@ -143,6 +143,36 @@ export function createControlPlane({ baseURL, headers = {}, fetchImpl = globalTh
     },
 
     /**
+     * update submits the new document of one existing object. Like every write
+     * it answers acceptance and the object it targets (KOSD-C-12).
+     *
+     * @param {string} kind
+     * @param {{namespace?: string, name: string, object: object}} request
+     * @returns {Promise<WriteResult>}
+     */
+    async update(kind, { namespace, name, object }) {
+      if (!name) {
+        throw new TypeError("更新对象需要名字");
+      }
+      return call("PUT", `/api/v1/resources/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`, {
+        query: { namespace },
+        body: object,
+      });
+    },
+
+    /**
+     * session reads the calling session: the account and the role the control
+     * plane evaluates every write against (KOSD-C-59). The route and the DTO are
+     * the identity API's own (kosd `pkg/identity/api.go`); the answer is returned
+     * as read and this client derives nothing from it.
+     *
+     * @returns {Promise<{username: string, role: string}>}
+     */
+    async session() {
+      return call("GET", "/api/v1/auth/session");
+    },
+
+    /**
      * act submits one action request. The answer is acceptance plus the object
      * it targets; the operation's progress is read from that object's state.
      *

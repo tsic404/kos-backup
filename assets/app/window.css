@@ -158,3 +158,8 @@ table.diffs td {
 [aria-busy="true"] .loading {
   display: block;
 }
+
+.entry [aria-invalid="true"] {
+  border: 1px solid;
+  outline: 1px solid currentColor;
+}
