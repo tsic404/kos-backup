@@ -4,10 +4,11 @@
 // for a terminal state and neither retries (KOSD-C-12).
 //
 // A restore defaults to a new instance: KOSD-C-41 and BACKUP-C-3 require the
-// in-place form to be declared explicitly, so `inPlace` is false unless the
-// caller says otherwise. The in-place declaration, its stop gate and the
-// restore form itself belong to the restore task; this module carries the
-// default submission only.
+// in-place form to be declared explicitly. The declaration is what makes the
+// entry show the stop requirement, and the control plane still judges whether
+// the application is stopped: a submission while it runs is rejected with a
+// reason, and no restore job is written (KOSD-C-41). This module adds no second
+// gate, so the window never disagrees with the control plane's judgement.
 
 /** The kernel kind a restore writes (KOSD-C-41). */
 export const RESTORE_KIND = "RestoreJob";
@@ -22,14 +23,34 @@ export const DRILL_ACTION = "drill";
 export const DRILL_KIND = "BackupPolicy";
 
 /**
- * restoreRequest builds the RestoreJob document for one restore. Without
- * `inPlace` the target application is a new instance and the source objects are
- * left untouched (BACKUP-C-3).
+ * restoreDeclaration is the restore form's two shapes. Without a declaration
+ * the form submits a new instance and asks for nothing else; a declared
+ * in-place restore requires the application to be stopped first (BACKUP-C-3).
  *
- * @param {{name: string, namespace: string, policy: string,
+ * @param {boolean} inPlace
+ */
+export function restoreDeclaration(inPlace) {
+  const declared = inPlace === true;
+  return { inPlace: declared, stopRequired: declared };
+}
+
+/**
+ * restoreRequest builds the RestoreJob document for one restore. The run names
+ * the backup instance the restore reads; without `inPlace` the target
+ * application is a new instance and the source objects are left untouched
+ * (BACKUP-C-3).
+ *
+ * @param {{name: string, namespace: string, policy: string, run: string,
  *          targetApplication: string, inPlace?: boolean}} options
  */
-export function restoreRequest({ name, namespace, policy, targetApplication, inPlace = false }) {
+export function restoreRequest({
+  name,
+  namespace,
+  policy,
+  run,
+  targetApplication,
+  inPlace = false,
+}) {
   if (!name) {
     throw new TypeError("恢复作业需要名字");
   }
@@ -38,6 +59,9 @@ export function restoreRequest({ name, namespace, policy, targetApplication, inP
   }
   if (!policy) {
     throw new TypeError("恢复作业需要给出被恢复的策略");
+  }
+  if (!run) {
+    throw new TypeError("恢复作业需要给出被恢复的运行");
   }
   if (!targetApplication) {
     throw new TypeError("恢复作业需要给出目标应用");
@@ -48,6 +72,7 @@ export function restoreRequest({ name, namespace, policy, targetApplication, inP
     metadata: { name, namespace },
     spec: {
       policy,
+      run,
       targetApplication,
       inPlace: inPlace === true,
     },
@@ -59,8 +84,7 @@ export function restoreRequest({ name, namespace, policy, targetApplication, inP
  * answer: acceptance and the object it targets (KOSD-C-12).
  *
  * @param {ReturnType<import("./control.js").createControlPlane>} client
- * @param {{name: string, namespace: string, policy: string,
- *          targetApplication: string, inPlace?: boolean}} options
+ * @param {Parameters<typeof restoreRequest>[0]} options
  * @returns {Promise<{accepted: boolean, ref?: object, idempotent?: boolean}>}
  */
 export async function submitRestore(client, options) {
@@ -69,6 +93,34 @@ export async function submitRestore(client, options) {
     namespace: request.metadata.namespace,
     object: request,
   });
+}
+
+/**
+ * submitRestoreEntry submits one restore entry and turns the control plane's
+ * judgement into the two outcomes the entry can show: accepted with the object
+ * it targets, or rejected with the reason. A rejection is not retried and does
+ * not submit a second request, so a refused in-place restore writes nothing
+ * (KOSD-C-41).
+ *
+ * @param {ReturnType<import("./control.js").createControlPlane>} client
+ * @param {Parameters<typeof restoreRequest>[0]} options
+ * @returns {Promise<{accepted: boolean, ref: object|null,
+ *                    reason: {code: string, message: string}|null}>}
+ */
+export async function submitRestoreEntry(client, options) {
+  try {
+    const answer = await submitRestore(client, options);
+    if (answer?.accepted === true) {
+      return { accepted: true, ref: answer.ref ?? null, reason: null };
+    }
+    return {
+      accepted: false,
+      ref: null,
+      reason: { code: "not-accepted", message: "控制面未接受恢复请求" },
+    };
+  } catch (error) {
+    return { accepted: false, ref: null, reason: failureReason(error) };
+  }
 }
 
 /**
@@ -105,4 +157,13 @@ export function drillRequest({ namespace, name }) {
  */
 export async function submitDrill(client, target) {
   return client.act(drillRequest(target));
+}
+
+/** failureReason keeps the control plane's code and message for display. */
+function failureReason(error) {
+  const envelope = error?.envelope ?? {};
+  return {
+    code: envelope.code || error?.code || "request-failed",
+    message: envelope.message || error?.message || "控制面请求失败",
+  };
 }

@@ -178,13 +178,15 @@ test("对象不可读时页面给原因，不显示为正常", async () => {
 });
 
 test("恢复入口提交的是恢复到新实例，走控制面 API", async () => {
-  const control = fakeControlPlane({ policies: [completedRunPolicy()] });
+  const policy = completedRunPolicy();
+  const control = fakeControlPlane({ policies: [policy] });
   const client = createControlPlane({ baseURL: BASE, fetchImpl: control.fetchImpl });
 
   const answer = await submitRestore(client, {
     name: "nightly-restore",
     namespace: "home",
     policy: "nightly",
+    run: policy.status.lastBackup.path,
     targetApplication: "media-restored",
   });
 
@@ -195,6 +197,7 @@ test("恢复入口提交的是恢复到新实例，走控制面 API", async () =
   assert.equal(request.query.namespace, "home");
   assert.equal(request.body.kind, "RestoreJob");
   assert.equal(request.body.spec.policy, "nightly");
+  assert.equal(request.body.spec.run, policy.status.lastBackup.path, "提交被选中的运行");
   assert.equal(request.body.spec.targetApplication, "media-restored");
   assert.equal(request.body.spec.inPlace, false, "未声明时提交的是恢复到新实例");
 

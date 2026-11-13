@@ -1,10 +1,13 @@
 // Fixtures for the backup page cases. Each object is what the control plane
-// would project for one BackupPolicy: the spec the user wrote and the status
-// the backup reconciler recorded. The expectations the cases assert are read
-// from these objects, never from the page model's own output.
+// would project for one BackupPolicy or RestoreJob: the spec the user wrote and
+// the status the controller recorded. The expectations the cases assert are
+// read from these objects, never from the page model's own output.
 
 /** The observation instant every fixture projection carries. */
 export const OBSERVED_AT = "2026-03-01T12:00:00.000Z";
+
+/** The backup run a restore reads, as the policy recorded it. */
+export const RESTORE_RUN = "/mnt/backup/home/nightly/2026-03-01";
 
 /** A policy that completed one run and passed its drill. */
 export function completedRunPolicy() {
@@ -115,19 +118,98 @@ export function projectionOf(object, observedAt = OBSERVED_AT) {
 }
 
 /**
- * fakeControlPlane serves the two control-plane routes this window uses and
- * records every request it received, so a case can assert both the answer and
- * what crossed the wire. `pageSize` splits the policy list into pages the way
- * the control plane does: a page carries its cursor and the next request must
- * echo it. Zero keeps one page, which is the control plane's own default case.
+ * restoreMetrics is one side of the four-item comparison KOSD-C-42 records:
+ * each table's row count, the volume's file count, its total bytes and its
+ * content checksum.
+ */
+export function restoreMetrics(overrides = {}) {
+  return {
+    tables: [
+      { name: "orders", rows: 120 },
+      { name: "lines", rows: 400 },
+    ],
+    files: 41,
+    bytes: 1048576,
+    checksum: "sha256:2f9c",
+    ...overrides,
+  };
+}
+
+/**
+ * restoreJob is the RestoreJob a controller would project. A new-instance
+ * restore records the application and volumes it created and the source
+ * objects it left in place; an in-place restore creates nothing and keeps the
+ * source application and PVC (BACKUP-C-3, KOSD-C-39).
+ */
+export function restoreJob({
+  name,
+  inPlace = false,
+  phase = "Succeeded",
+  targetApplication,
+  observed,
+  diffs = [],
+  reason = "",
+  created,
+  source,
+} = {}) {
+  return {
+    apiVersion: "kos.tsic.top/v1beta1",
+    kind: "RestoreJob",
+    metadata: {
+      name: name ?? (inPlace ? "media-inplace" : "media-restore"),
+      namespace: "home",
+    },
+    spec: {
+      policy: "nightly",
+      run: RESTORE_RUN,
+      targetApplication: targetApplication ?? (inPlace ? "media" : "media-restored"),
+      inPlace,
+    },
+    status: {
+      phase,
+      conditions: [],
+      startedAt: "2026-03-01T12:00:05Z",
+      completedAt: "2026-03-01T12:06:00Z",
+      baseline: restoreMetrics(),
+      observed: observed ?? restoreMetrics(),
+      diffs,
+      reason,
+      created:
+        created ??
+        (inPlace ? undefined : { application: "media-restored", volumes: ["media-restored-data"] }),
+      source: source ?? {
+        application: "media",
+        volumes: ["media-data"],
+        pvc: "media-data-pvc",
+        retained: true,
+      },
+    },
+  };
+}
+
+/**
+ * fakeControlPlane serves the control-plane routes this window uses and records
+ * every request it received, so a case can assert both the answer and what
+ * crossed the wire. `pageSize` splits the policy list into pages the way the
+ * control plane does: a page carries its cursor and the next request must echo
+ * it. Zero keeps one page, which is the control plane's own default case.
+ *
+ * `appRunning` is the admission state of the application an in-place restore
+ * targets: while it is true the control plane rejects an in-place submission
+ * and creates nothing (BACKUP-C-3, KOSD-C-41). `state.created` collects the
+ * restore jobs the control plane accepted, so a case can tell a rejection from
+ * a job that was never written.
  */
 export function fakeControlPlane({
   policies = [],
+  restores = [],
   observedAt = OBSERVED_AT,
   readFailure = null,
   pageSize = 0,
+  appRunning = false,
 } = {}) {
   const requests = [];
+  const state = { appRunning, created: [] };
 
   async function fetchImpl(url, init = {}) {
     const target = new URL(url);
@@ -157,8 +239,24 @@ export function fakeControlPlane({
       }
       return jsonResponse(200, page);
     }
-    if (method === "POST" && target.pathname === "/api/v1/resources/RestoreJob") {
+    if (method === "GET" && target.pathname === "/api/v1/resources/RestoreJob") {
       return jsonResponse(200, {
+        items: restores.map((job) => projectionOf(job, observedAt)),
+      });
+    }
+    if (method === "POST" && target.pathname === "/api/v1/resources/RestoreJob") {
+      if (body?.spec?.inPlace === true && state.appRunning) {
+        return jsonResponse(409, {
+          error: {
+            code: "application-running",
+            message: `应用 ${body.spec.targetApplication} 未停机，原地恢复被拒绝`,
+            stage: "write",
+            retryable: true,
+          },
+        });
+      }
+      state.created.push(body);
+      return jsonResponse(201, {
         accepted: true,
         ref: {
           group: "kos.tsic.top",
@@ -188,7 +286,7 @@ export function fakeControlPlane({
     });
   }
 
-  return { fetchImpl, requests };
+  return { fetchImpl, requests, state };
 }
 
 /** jsonResponse makes the minimal Response the client reads. */

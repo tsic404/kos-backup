@@ -1,13 +1,9 @@
-// The backup page of BACKUP-C-1: the policy, its runs, the target with its
-// failure domain, and the drill with its differences. Every item is built from
-// one control-plane projection, so its state is the kernel object's own state
-// and its observation time is the one the projection carries (KOSD-C-13).
-//
-// An item that cannot be presented as normal carries the reason: an
-// observation older than the freshness bound, a policy without a target, a run
-// or drill the object never recorded, and a target whose failure domain cannot
-// be determined. Nothing here invents a state the object does not have; the
-// window's own markers are named below and never shadow a kernel value.
+// The backup page of BACKUP-C-1 and the restore result of BACKUP-C-3 read from
+// control-plane projections, so every shown state is the kernel object's own
+// state and every observation time is the one the projection carries
+// (KOSD-C-13). A restore is a success only when the four items KOSD-C-42 fixes
+// are equal, never because the job claims it; an item that cannot be presented
+// as normal carries its reason instead of a normal-looking value.
 
 /** The one freshness bound every read is judged by (KOSD-C-13). */
 export const STALE_THRESHOLD_MS = 2 * 60 * 1000;
@@ -21,6 +17,11 @@ export const ITEM_DRILL = "drill";
 /** The two actions the page offers (BACKUP-C-1, BACKUP-C-3). */
 export const ENTRY_RESTORE = "restore";
 export const ENTRY_DRILL = "drill";
+
+/** The restore judgement: only four equal items are a success (KOSD-C-42). */
+export const RESTORE_SUCCEEDED = "Succeeded";
+export const RESTORE_FAILED = "Failed";
+const RESTORE_PENDING = "Pending";
 
 /** A kernel value the page shows verbatim when the object has one. */
 const KERNEL_SUCCEEDED = "Succeeded";
@@ -37,23 +38,30 @@ export const STATE_UNREADABLE = "Unreadable";
 const STATE_UNKNOWN = "Unknown";
 
 /**
- * buildPage assembles the page from the BackupPolicy projections one list
- * returned.
+ * buildPage assembles the page from the BackupPolicy and RestoreJob
+ * projections the list calls returned.
  *
- * @param {{policies: import("./control.js").Projection[], now?: Date|string|number}} input
+ * @param {{policies: import("./control.js").Projection[],
+ *          restores?: import("./control.js").Projection[],
+ *          now?: Date|string|number}} input
  */
-export function buildPage({ policies, now = new Date() }) {
+export function buildPage({ policies, restores = [], now = new Date() }) {
   if (!Array.isArray(policies)) {
     throw new TypeError("备份页需要策略投影列表");
   }
+  if (!Array.isArray(restores)) {
+    throw new TypeError("备份页需要恢复作业投影列表");
+  }
   const clock = toDate(now);
   const views = policies.map((projection) => policyView(projection, clock));
-  const observation = oldestObservation(views);
+  const restoreViews = restores.map((projection) => restoreView(projection, clock));
+  const observation = oldestObservation([...views, ...restoreViews]);
   return {
     state: STATE_UNKNOWN,
     observedAt: observation.observedAt,
     stale: observation.stale,
     policies: views,
+    restores: restoreViews,
   };
 }
 
@@ -77,6 +85,7 @@ export function buildUnreadablePage({ error, now = new Date() }) {
       status: error?.status,
     },
     policies: [],
+    restores: [],
   };
 }
 
@@ -99,6 +108,7 @@ export function policyView(projection, now = new Date()) {
   const drill = status.lastDrill ?? null;
   const running = status.running ?? null;
   const target = spec.target ?? null;
+  const restoreRuns = runsOf(status);
 
   return {
     id: identityOf(projection, object),
@@ -106,6 +116,7 @@ export function policyView(projection, now = new Date()) {
     name: projection?.ref?.name ?? object.metadata?.name ?? "",
     observedAt,
     stale: staleness.stale,
+    restoreRuns,
     items: {
       [ITEM_POLICY]: {
         id: ITEM_POLICY,
@@ -150,7 +161,212 @@ export function policyView(projection, now = new Date()) {
         reason: drillReason(drill),
       },
     },
-    entries: entriesFor(run, drill),
+    entries: entriesFor(run, drill, restoreRuns),
+  };
+}
+
+/**
+ * restoreView builds one restore result from a RestoreJob projection: phase,
+ * baseline, observed values, differences, and the created and preserved source
+ * objects (BACKUP-C-3, KOSD-C-39). Its verdict is the four-item judgement
+ * KOSD-C-42 fixes, never the job's own claim.
+ *
+ * @param {import("./control.js").Projection} projection
+ * @param {Date} now
+ */
+export function restoreView(projection, now = new Date()) {
+  const clock = toDate(now);
+  const object = projection?.object ?? {};
+  const spec = object.spec ?? {};
+  const status = object.status ?? {};
+  const observedAt = projection?.observedAt ?? null;
+  const staleness = stalenessOf(observedAt, clock);
+  const baseline = metricsOf(status.baseline);
+  const observed = metricsOf(status.observed);
+  const judgement = judgeRestore({
+    phase: status.phase,
+    baseline,
+    observed,
+    diffs: status.diffs,
+    reason: status.reason,
+  });
+
+  return {
+    id: identityOf(projection, object),
+    namespace: projection?.ref?.namespace ?? object.metadata?.namespace ?? "",
+    name: projection?.ref?.name ?? object.metadata?.name ?? "",
+    observedAt,
+    stale: staleness.stale,
+    inPlace: spec.inPlace === true,
+    policy: spec.policy ?? "",
+    run: spec.run ?? "",
+    targetApplication: spec.targetApplication ?? "",
+    phase: status.phase ?? STATE_UNKNOWN,
+    verdict: judgement.verdict,
+    baseline,
+    observed,
+    diffs: judgement.diffs,
+    reason: judgement.reason,
+    created: createdOf(status.created),
+    source: sourceOf(status.source),
+  };
+}
+
+/**
+ * judgeRestore decides what the result surface may claim. A phase other than
+ * Succeeded is never a success; Succeeded is a success only when all four items
+ * are recorded and equal (KOSD-C-42), so a job that says Succeeded over
+ * differing data is shown as a failure with the differences listed.
+ */
+function judgeRestore({ phase, baseline, observed, diffs, reason }) {
+  const recorded = Array.isArray(diffs) ? diffs : [];
+  if (phase === KERNEL_FAILED) {
+    return {
+      verdict: RESTORE_FAILED,
+      diffs: recorded,
+      reason: {
+        code: "restore-failed",
+        message: reasonText(reason, recorded) || "恢复失败，对象未给出原因",
+        diffs: recorded,
+      },
+    };
+  }
+  if (phase !== KERNEL_SUCCEEDED) {
+    return { verdict: RESTORE_PENDING, diffs: recorded, reason: null };
+  }
+  const comparison = compareFour(baseline, observed);
+  if (comparison.unverified) {
+    return {
+      verdict: RESTORE_FAILED,
+      diffs: [],
+      reason: {
+        code: "restore-unverified",
+        message: "恢复没有记录完整的基线或观测值，无法确认四项全等",
+        diffs: [],
+      },
+    };
+  }
+  if (comparison.diffs.length > 0) {
+    return {
+      verdict: RESTORE_FAILED,
+      diffs: comparison.diffs,
+      reason: {
+        code: "restore-mismatch",
+        message: `恢复数据与基线不一致：${describeDiffs(comparison.diffs)}`,
+        diffs: comparison.diffs,
+      },
+    };
+  }
+  return { verdict: RESTORE_SUCCEEDED, diffs: [], reason: null };
+}
+
+/**
+ * metricsOf normalizes one side of the four-item comparison: every table's row
+ * count, the file count, the total bytes and the content checksum. A side the
+ * object never recorded is null rather than zeros, so an unrecorded value is
+ * never presented as an equal one.
+ */
+export function metricsOf(metrics) {
+  if (!metrics || typeof metrics !== "object") {
+    return null;
+  }
+  return {
+    tables: Array.isArray(metrics.tables)
+      ? metrics.tables.map((table) => ({
+          name: typeof table?.name === "string" ? table.name : "",
+          rows: table?.rows ?? null,
+        }))
+      : [],
+    files: metrics.files ?? null,
+    bytes: metrics.bytes ?? null,
+    checksum: metrics.checksum ?? null,
+  };
+}
+
+/**
+ * compareFour compares both sides item by item. Tables are matched by name, so
+ * a different order is the same data; every recorded value must be present.
+ */
+function compareFour(baseline, observed) {
+  if (!baseline || !observed) {
+    return { unverified: true, diffs: [] };
+  }
+  if (
+    baseline.files === null ||
+    baseline.bytes === null ||
+    baseline.checksum === null ||
+    observed.files === null ||
+    observed.bytes === null ||
+    observed.checksum === null
+  ) {
+    return { unverified: true, diffs: [] };
+  }
+  const diffs = [];
+  const rowsByName = (side) => new Map(side.tables.map((table) => [table.name, table.rows]));
+  const baseRows = rowsByName(baseline);
+  const observedRows = rowsByName(observed);
+  const names = [...new Set([...baseRows.keys(), ...observedRows.keys()])].sort();
+  for (const name of names) {
+    const base = baseRows.has(name) ? baseRows.get(name) : null;
+    const seen = observedRows.has(name) ? observedRows.get(name) : null;
+    if (base === null || seen === null || String(base) !== String(seen)) {
+      diffs.push({ item: `tables.${name}`, baseline: quantity(base), observed: quantity(seen) });
+    }
+  }
+  for (const item of ["files", "bytes"]) {
+    if (String(baseline[item]) !== String(observed[item])) {
+      diffs.push({ item, baseline: quantity(baseline[item]), observed: quantity(observed[item]) });
+    }
+  }
+  if (String(baseline.checksum) !== String(observed.checksum)) {
+    diffs.push({ item: "checksum", baseline: quantity(baseline.checksum), observed: quantity(observed.checksum) });
+  }
+  diffs.sort((left, right) => (left.item < right.item ? -1 : left.item > right.item ? 1 : 0));
+  return { unverified: false, diffs };
+}
+
+/** runsOf lists the runs a restore may name: the recorded runs, else the last one. */
+function runsOf(status) {
+  const recorded = Array.isArray(status?.runs) ? status.runs : [];
+  const runs = recorded.length > 0 ? recorded : status?.lastBackup ? [status.lastBackup] : [];
+  return runs
+    .map((run) => ({
+      path: typeof run?.path === "string" ? run.path : "",
+      completedAt: run?.completedAt ?? null,
+      consistency: run?.consistency ?? "",
+      succeeded: run?.succeeded === true,
+    }))
+    .filter((run) => run.path !== "");
+}
+
+function reasonText(reason, diffs) {
+  if (typeof reason === "string" && reason !== "") {
+    return reason;
+  }
+  return describeDiffs(diffs);
+}
+
+function quantity(value) {
+  return value === null || value === undefined ? "—" : String(value);
+}
+
+function createdOf(created) {
+  return {
+    application: typeof created?.application === "string" ? created.application : "",
+    volumes: Array.isArray(created?.volumes)
+      ? created.volumes.filter((volume) => typeof volume === "string")
+      : [],
+  };
+}
+
+function sourceOf(source) {
+  return {
+    application: typeof source?.application === "string" ? source.application : "",
+    volumes: Array.isArray(source?.volumes)
+      ? source.volumes.filter((volume) => typeof volume === "string")
+      : [],
+    pvc: typeof source?.pvc === "string" ? source.pvc : "",
+    retained: source?.retained === true,
   };
 }
 
@@ -256,13 +472,16 @@ function describeDiffs(diffs) {
     .join("；");
 }
 
-function entriesFor(run, drill) {
+function entriesFor(run, drill, restoreRuns = []) {
+  const restorable = restoreRuns.length > 0;
   return [
     {
       id: ENTRY_RESTORE,
       action: ENTRY_RESTORE,
-      available: true,
-      reason: null,
+      available: restorable,
+      reason: restorable
+        ? null
+        : { code: "no-run", message: "没有可恢复的运行，恢复入口不可用" },
     },
     {
       id: ENTRY_DRILL,

@@ -24,6 +24,16 @@ export function entryMarkup(html, id) {
   return blockMarkup(html, `data-entry="${id}"`, "form");
 }
 
+/** restoreMarkup returns the markup of one rendered restore result card. */
+export function restoreMarkup(html, id) {
+  return blockMarkup(html, `data-restore="${id}"`, "article");
+}
+
+/** metricsMarkup returns one side of a restore's four-item comparison. */
+export function metricsMarkup(html, side) {
+  return blockMarkup(html, `data-metrics="${side}"`, "section");
+}
+
 /** attributeIn returns one attribute's value from a fragment, or null. */
 export function attributeIn(markup, name) {
   const match = String(markup).match(new RegExp(`\\b${name}="([^"]*)"`));
