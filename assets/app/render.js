@@ -17,6 +17,7 @@ import {
   ITEM_TARGET,
   RESTORE_FAILED,
   RESTORE_SUCCEEDED,
+  SOURCE_COMPUTED,
 } from "./model.js";
 import { CONSISTENCY_CRASH, CONSISTENCY_HOOK, CONSISTENCY_LEVELS, CONSISTENCY_QUIESCED } from "./policy.js";
 
@@ -74,6 +75,15 @@ const TEXT = {
   failureDomain: "失败域",
   drillRun: "演练对象",
   reason: "原因",
+  sourceType: "来源类型",
+  source: "来源",
+  previousResultSource: "上次完成结果来源",
+  sourceField: "字段",
+  sourceObject: "对象源",
+  sourceComputed: "计算源",
+  sourceRule: "规则",
+  sourceInput: "输入",
+  diffSource: "差异项来源类型",
   diffs: "差异项",
   diffItem: "项目",
   diffBaseline: "基线",
@@ -277,11 +287,60 @@ function renderDrillItem(item) {
 }
 
 function itemFrame(id, item, state, body, extraAttributes = "") {
-  return `<section class="item" data-item="${id}" data-state="${escapeHTML(present(state))}" data-stale="${item.stale === true}"${extraAttributes === "" ? "" : " " + extraAttributes}>
+  return `<section class="item" data-item="${id}" data-state="${escapeHTML(present(state))}" data-stale="${item.stale === true}" data-source-type="${escapeHTML(sourceTypeLabel(item.source))}" data-source="${escapeHTML(sourceName(item.source))}" data-source-field="${escapeHTML(item.source?.field ?? "")}"${extraAttributes === "" ? "" : " " + extraAttributes}>
     <h3>${itemTitle(id)}</h3>
     ${item.stale === true ? staleMark() : ""}
+    ${renderSource(item.source)}
     ${body}
+    ${item.previousSource ? renderSource(item.previousSource, TEXT.previousResultSource, "data-previous-source") : ""}
+    ${item.staleReason ? reasonBlock(item.staleReason) : ""}
   </section>`;
+}
+
+/**
+ * renderSource names the source an item reads: its type and the object or rule
+ * the value came from (BACKUP-C-1, KOSD-C-53).
+ */
+function renderSource(source, title = TEXT.source, marker = "data-source-facts") {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+  const field = source.field ? `（${TEXT.sourceField}：${source.field}）` : "";
+  return `<dl class="facts source" ${marker}>
+      <div class="fact"><dt>${TEXT.sourceType}</dt><dd>${escapeHTML(sourceTypeLabel(source))}</dd></div>
+      <div class="fact"><dt>${title}</dt><dd>${escapeHTML(sourceName(source))}${escapeHTML(field)}</dd></div>
+    </dl>`;
+}
+
+/** renderDiffSource names the rule and input a computed difference follows. */
+function renderDiffSource(diffSource) {
+  if (!diffSource || typeof diffSource !== "object") {
+    return "";
+  }
+  const input = diffSource.input
+    ? `；${TEXT.sourceInput}：${escapeHTML(diffSource.input)}`
+    : "";
+  return `<p class="source" data-diff-source-type="${escapeHTML(sourceTypeLabel(diffSource))}" data-diff-source="${escapeHTML(sourceName(diffSource))}">${TEXT.diffSource}：${escapeHTML(sourceTypeLabel(diffSource))}；${TEXT.sourceRule}：${escapeHTML(present(diffSource.rule))}${input}</p>`;
+}
+
+function sourceTypeLabel(source) {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+  return source.type === SOURCE_COMPUTED ? TEXT.sourceComputed : TEXT.sourceObject;
+}
+
+function sourceName(source) {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+  if (source.type === SOURCE_COMPUTED) {
+    return source.rule ?? "";
+  }
+  const where = [source.namespace, source.name]
+    .filter((part) => part !== "" && part !== undefined)
+    .join("/");
+  return [source.kind, where].filter((part) => part !== "" && part !== undefined).join(" ");
 }
 
 function itemTitle(id) {
@@ -577,7 +636,7 @@ function pageReason(reason) {
 }
 
 function reasonBlock(reason) {
-  return `<p class="reason" data-reason data-code="${escapeHTML(present(reason.code))}">${TEXT.reason}：${escapeHTML(present(reason.message))}</p>${renderDiffs(reason.diffs)}`;
+  return `<p class="reason" data-reason data-code="${escapeHTML(present(reason.code))}">${TEXT.reason}：${escapeHTML(present(reason.message))}</p>${renderDiffs(reason.diffs)}${renderDiffSource(reason.diffSource)}`;
 }
 
 function renderDiffs(diffs) {

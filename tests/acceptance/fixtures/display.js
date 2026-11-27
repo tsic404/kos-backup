@@ -40,6 +40,17 @@ export function metricsMarkup(html, side) {
   return blockMarkup(html, `data-metrics="${side}"`, "section");
 }
 
+/** diffSourceMarkup returns the computed-source line under a difference table. */
+export function diffSourceMarkup(html) {
+  const match = String(html).match(/<p class="source"[^>]*data-diff-source="[^"]*"[^>]*>[\s\S]*?<\/p>/);
+  return match ? match[0] : "";
+}
+
+/** previousSourceMarkup returns the attribution of a card's last completed run. */
+export function previousSourceMarkup(html) {
+  return blockMarkup(html, "data-previous-source", "dl");
+}
+
 /**
  * formValues reads one rendered form the way the window's submit handler does:
  * every named control's current value, a checked box as `on`. A select answers
