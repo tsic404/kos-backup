@@ -26,6 +26,25 @@ export const ENTRY_DRILL = "drill";
 /** The write entry a session gets on a policy it manages (BACKUP-C-2). */
 export const ENTRY_EDIT = "edit";
 
+/** The two source types a display item declares (KOSD-C-53). */
+export const SOURCE_OBJECT = "object";
+export const SOURCE_COMPUTED = "computed";
+
+/** The rule a computed difference follows (KOSD-C-42). */
+export const DIFF_RULE = "KOSD-C-42";
+
+/** The policy fields the policy item shows (BACKUP-C-1). */
+const POLICY_FIELDS = [
+  "status.phase",
+  "status.health",
+  "status.conditions",
+  "status.nextRunTime",
+  "spec.selector",
+  "spec.schedule",
+  "spec.consistency",
+  "spec.retention",
+].join("、");
+
 /** The restore judgement: only four equal items are a success (KOSD-C-42). */
 export const RESTORE_SUCCEEDED = "Succeeded";
 export const RESTORE_FAILED = "Failed";
@@ -129,7 +148,7 @@ export function policyView(projection, now = new Date(), session = null) {
   const status = object.status ?? {};
   const observedAt = projection?.observedAt ?? null;
   const staleness = stalenessOf(observedAt, clock);
-  const stamp = { observedAt, stale: staleness.stale };
+  const stamp = { observedAt, stale: staleness.stale, staleReason: staleness.reason };
   const manageable = canManagePolicy(object, session);
 
   const run = status.lastBackup ?? null;
@@ -137,6 +156,13 @@ export function policyView(projection, now = new Date(), session = null) {
   const running = status.running ?? null;
   const target = spec.target ?? null;
   const restoreRuns = runsOf(status);
+  const source = objectSourceOf(projection, object);
+  const sourceReason = isSourceUnobservable(projection)
+    ? {
+        code: "source-unobservable",
+        message: "投影没有携带对象，无法读取这一项的来源",
+      }
+    : null;
 
   return {
     id: identityOf(projection, object),
@@ -149,12 +175,13 @@ export function policyView(projection, now = new Date(), session = null) {
       [ITEM_POLICY]: {
         id: ITEM_POLICY,
         ...stamp,
+        source: { ...source, field: POLICY_FIELDS },
         state: {
           phase: status.phase ?? STATE_UNKNOWN,
           health: status.health?.state ?? STATE_UNKNOWN,
         },
         conditions: status.conditions ?? [],
-        reason: failedCondition(status.conditions),
+        reason: sourceReason ?? failedCondition(status.conditions),
         policy: {
           selector: spec.selector ?? "",
           schedule: spec.schedule ?? "",
@@ -166,27 +193,33 @@ export function policyView(projection, now = new Date(), session = null) {
       [ITEM_RUNS]: {
         id: ITEM_RUNS,
         ...stamp,
+        // The state shown is the active run when one is recorded; the last
+        // completed result keeps its own attribution below it.
+        source: { ...source, field: running ? "status.running" : "status.lastBackup" },
+        previousSource: running && run ? { ...source, field: "status.lastBackup" } : null,
         state: runState(running, run),
         running: running ? pickRunning(running) : null,
         run: run ? pickRun(run) : null,
-        reason: runReason(running, run),
+        reason: sourceReason ?? runReason(running, run),
       },
       [ITEM_TARGET]: {
         id: ITEM_TARGET,
         ...stamp,
+        source: { ...source, field: "spec.target" },
         state: targetState(target),
         target: {
           path: target?.path ?? "",
           failureDomain: target?.failureDomain ?? "",
         },
-        reason: targetReason(target),
+        reason: sourceReason ?? targetReason(target),
       },
       [ITEM_DRILL]: {
         id: ITEM_DRILL,
         ...stamp,
+        source: { ...source, field: "status.lastDrill" },
         state: drill ? drill.phase ?? STATE_UNKNOWN : STATE_NONE,
         drill: drill ? pickDrill(drill) : null,
-        reason: drillReason(drill),
+        reason: sourceReason ?? drillReason(drill),
       },
     },
     manageable,
@@ -459,10 +492,12 @@ function runReason(running, run) {
   if (run.succeeded === true) {
     return null;
   }
+  const diffs = Array.isArray(run.diffs) ? run.diffs : [];
   return {
     code: "run-failed",
     message: typeof run.reason === "string" && run.reason !== "" ? run.reason : "运行失败，对象未给出原因",
-    diffs: run.diffs ?? [],
+    diffs,
+    diffSource: diffSourceOf(run.path, diffs),
   };
 }
 
@@ -480,10 +515,10 @@ function targetReason(target) {
 
 function drillReason(drill) {
   if (!drill) {
-    return null;
+    return { code: "drill-unobserved", message: "策略还没有演练记录" };
   }
   if (drill.phase === KERNEL_FAILED || drill.succeeded === false) {
-    const diffs = drill.diffs ?? [];
+    const diffs = Array.isArray(drill.diffs) ? drill.diffs : [];
     const message =
       typeof drill.reason === "string" && drill.reason !== ""
         ? drill.reason
@@ -492,9 +527,52 @@ function drillReason(drill) {
       code: "drill-mismatch",
       message: message === "" ? "演练失败，对象未给出原因" : message,
       diffs,
+      diffSource: diffSourceOf(drill.run, diffs),
     };
   }
   return null;
+}
+
+/**
+ * diffSourceOf names the KOSD-C-42 rule and the run whose comparison produced
+ * a difference. No difference means no computed source to claim.
+ */
+function diffSourceOf(input, diffs) {
+  if (!Array.isArray(diffs) || diffs.length === 0) {
+    return null;
+  }
+  return {
+    type: SOURCE_COMPUTED,
+    rule: DIFF_RULE,
+    input: typeof input === "string" ? input : "",
+  };
+}
+
+/**
+ * objectSourceOf names the object one item reads: the projection's reference
+ * first, so a source stays readable even when the object body is missing.
+ *
+ * @param {import("./control.js").Projection|undefined} projection
+ * @param {object} object
+ */
+function objectSourceOf(projection, object) {
+  return {
+    type: SOURCE_OBJECT,
+    kind: projection?.ref?.kind ?? object.kind ?? "BackupPolicy",
+    namespace: projection?.ref?.namespace ?? object.metadata?.namespace ?? "",
+    name: projection?.ref?.name ?? object.metadata?.name ?? "",
+  };
+}
+
+/** isSourceUnobservable reports a projection that carried no object body. */
+function isSourceUnobservable(projection) {
+  const object = projection?.object;
+  return (
+    object === undefined ||
+    object === null ||
+    typeof object !== "object" ||
+    Array.isArray(object)
+  );
 }
 
 /** describeDiffs renders the differences the drill found, item by item. */

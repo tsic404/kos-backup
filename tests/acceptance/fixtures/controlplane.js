@@ -62,6 +62,19 @@ export function completedRunPolicy() {
   };
 }
 
+/** A policy with a completed run and a newer run still in flight. */
+export function runningPolicy() {
+  const policy = completedRunPolicy();
+  policy.metadata.name = "nightly-running";
+  policy.status.running = {
+    kind: "Backup",
+    run: "/mnt/backup/home/nightly-running/2026-03-02",
+    scope: "app=media",
+    startedAt: "2026-03-02T03:00:05Z",
+  };
+  return policy;
+}
+
 /** A policy whose drill found one extra file and failed the run. */
 export function failedDrillPolicy() {
   const policy = completedRunPolicy();
